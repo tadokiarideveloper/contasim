@@ -1,6 +1,8 @@
 /* ContaSim — simulação bancária completa, sem integração real. */
-const DB_KEY = "contasim_db_v2";
-const SESSION_KEY = "contasim_session_v2";
+const DB_KEY = "contasim_db_v4_realtime";
+const SESSION_KEY = "contasim_session_v4_realtime";
+const API_STATE_URL = "/api/state";
+const SYNC_INTERVAL_MS = 1200;
 const moneyFmt = new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" });
 const dateFmt = new Intl.DateTimeFormat("pt-BR", { dateStyle: "short", timeStyle: "short" });
 
@@ -18,6 +20,12 @@ const brDate = (iso) => iso ? dateFmt.format(new Date(iso)) : "-";
 const parseCurrency = (value) => Number(String(value || "0").replace(/\./g, "").replace(",", "."));
 const maskText = (value = "") => String(value || "").length ? "••••••" : "-";
 const sameText = (a = "", b = "") => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+
+let sync = { online: false, lastPull: 0, pulling: false, pushing: false, started: false };
+let pushTimer = null;
+let localChannel = null;
+try { localChannel = new BroadcastChannel("contasim_realtime_v4"); } catch {}
+
 function syncDBAndRefresh(message = "Atualizado em tempo real.") {
   saveDB();
   if (message) toast(message);
@@ -54,15 +62,17 @@ function seedDB() {
   };
 
   return {
-    version: 2,
+    version: 4,
+    revision: 1,
     createdAt: t,
-    clients: [client1, client2],
+    updatedAt: t,
+    clients: [],
     collaborators: [
       { id: "owner-master", name: "Luis Fernando", username: "16581769", password: "0237162610", role: "owner", active: true, protected: true, createdAt: t }
     ],
     pendingDeposits: [],
     activity: [
-      { id: uid("log"), date: t, actor: "Sistema", action: "Simulação iniciada com acesso owner padrão protegido e clientes de teste." }
+      { id: uid("log"), date: t, actor: "Sistema", action: "Simulação iniciada com acesso owner principal protegido." }
     ]
   };
 }
@@ -76,7 +86,13 @@ function loadDB() {
       return seeded;
     }
     const parsed = JSON.parse(raw);
-    if (!parsed.version || parsed.version < 2) throw new Error("versão antiga");
+    if (!parsed.version || parsed.version < 4) throw new Error("versão antiga");
+    parsed.clients ||= [];
+    parsed.collaborators ||= [];
+    parsed.pendingDeposits ||= [];
+    parsed.activity ||= [];
+    parsed.revision ||= 1;
+    parsed.updatedAt ||= parsed.createdAt || now();
     return parsed;
   } catch (err) {
     const seeded = seedDB();
@@ -85,8 +101,82 @@ function loadDB() {
   }
 }
 
-function saveDB() {
+function saveDB(options = {}) {
+  const { push = true, silent = false } = options;
+  db.version = 4;
+  db.revision = Number(db.revision || 0) + 1;
+  db.updatedAt = now();
   localStorage.setItem(DB_KEY, JSON.stringify(db));
+  if (!silent) localChannel?.postMessage({ type: "db-updated", revision: db.revision, at: db.updatedAt });
+  if (push) queuePushRemote();
+}
+
+function saveRemoteStateLocalOnly(nextDb) {
+  db = nextDb;
+  localStorage.setItem(DB_KEY, JSON.stringify(db));
+  localChannel?.postMessage({ type: "db-pulled", revision: db.revision, at: db.updatedAt });
+}
+
+function queuePushRemote() {
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(pushRemote, 220);
+}
+
+async function pushRemote() {
+  if (sync.pushing) return;
+  sync.pushing = true;
+  try {
+    const res = await fetch(API_STATE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      body: JSON.stringify({ state: db })
+    });
+    if (!res.ok) throw new Error("API indisponível");
+    sync.online = true;
+  } catch {
+    sync.online = false;
+  } finally {
+    sync.pushing = false;
+  }
+}
+
+async function pullRemote(force = false) {
+  if (sync.pulling) return false;
+  sync.pulling = true;
+  try {
+    const res = await fetch(`${API_STATE_URL}?t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error("API indisponível");
+    const data = await res.json();
+    sync.online = true;
+    sync.lastPull = Date.now();
+    if (!data.state) {
+      await pushRemote();
+      return false;
+    }
+    const remote = data.state;
+    if (!remote.version || remote.version < 4) return false;
+    const localRev = Number(db.revision || 0);
+    const remoteRev = Number(remote.revision || 0);
+    const remoteIsNewer = remoteRev > localRev || (remoteRev === localRev && String(remote.updatedAt || "") > String(db.updatedAt || ""));
+    if (remoteIsNewer) {
+      saveRemoteStateLocalOnly(remote);
+      if (sync.started) render();
+      return true;
+    }
+    if (localRev > remoteRev || String(db.updatedAt || "") > String(remote.updatedAt || "")) queuePushRemote();
+    return false;
+  } catch {
+    sync.online = false;
+    return false;
+  } finally {
+    sync.pulling = false;
+  }
+}
+
+function syncBadge() {
+  return sync.online
+    ? `<span class="badge ok">tempo real servidor</span>`
+    : `<span class="badge warning">modo local</span>`;
 }
 
 function loadSession() {
@@ -157,7 +247,8 @@ function baseHero() {
         <div class="brand"><div class="logo-mark">CS</div><span>ContaSim</span></div>
         <h1 class="hero-title">Conta bancária <span>simulada</span> completa.</h1>
         <p class="hero-subtitle">Área de cliente, cadastro, saldo, extrato, Pix por chave, Pix por QR/Copia e Cola, depósito pendente de autorização e painel colaborativo por cargos.</p>
-        <div class="warning-line">Ambiente fictício. Não use dados reais. Não existe banco real, Pix real, API real, boleto real ou movimentação financeira real.</div>
+        <div class="warning-line">Ambiente fictício. Não use dados reais. Não existe banco real, Pix real, API bancária real, boleto real ou movimentação financeira real.</div>
+        <div class="actions-row" style="margin-top:14px">${syncBadge()}<span class="badge">rev. ${db.revision || 1}</span></div>
       </div>
       <div class="stat-row">
         <div class="stat-pill"><strong>${db.clients.length}</strong><small>clientes simulados</small></div>
@@ -222,8 +313,9 @@ function renderClientAuthForm() {
   }
 }
 
-function registerClient(e) {
+async function registerClient(e) {
   e.preventDefault();
+  await pullRemote(true);
   const data = Object.fromEntries(new FormData(e.target));
   const username = data.username.trim();
   if (data.password !== data.password2) return toast("As senhas não conferem.");
@@ -249,8 +341,9 @@ function registerClient(e) {
   render();
 }
 
-function loginClient(e) {
+async function loginClient(e) {
   e.preventDefault();
+  await pullRemote(true);
   const data = Object.fromEntries(new FormData(e.target));
   const client = db.clients.find(c => sameText(c.username, data.username) && c.password === data.password);
   if (!client) return toast("Usuário ou senha inválidos.");
@@ -282,8 +375,9 @@ function renderStaffLogin(app) {
   $("staffLoginForm").onsubmit = loginStaff;
 }
 
-function loginStaff(e) {
+async function loginStaff(e) {
   e.preventDefault();
+  await pullRemote(true);
   const data = Object.fromEntries(new FormData(e.target));
   const staff = db.collaborators.find(c => sameText(c.username, data.username) && c.password === data.password);
   if (!staff) return toast("Usuário ou senha inválidos.");
@@ -307,7 +401,7 @@ function renderTopbar(title, subtitle, badges = []) {
       <div class="brand"><div class="logo-mark">CS</div><div><div>${title}</div><small class="small-muted">${subtitle}</small></div></div>
       <div class="right">
         <span class="badge warning">100% simulação</span>
-        ${badges.join("")}
+        ${syncBadge()}${badges.join("")}
         <button class="btn secondary small" id="logoutBtn">Sair</button>
       </div>
     </header>`;
@@ -1091,8 +1185,9 @@ function openAddClientModal() {
   $("modalAddClient").onsubmit = addClientByOwner;
 }
 
-function addClientByOwner(e) {
+async function addClientByOwner(e) {
   e.preventDefault();
+  await pullRemote(true);
   const staff = currentStaff();
   if (!perms(staff.role).addClient) return toast("Sem permissão.");
   const data = Object.fromEntries(new FormData(e.target));
@@ -1123,8 +1218,9 @@ function openEditClientModal(id) {
   $("modalEditClient").onsubmit = editClientByOwner;
 }
 
-function editClientByOwner(e) {
+async function editClientByOwner(e) {
   e.preventDefault();
+  await pullRemote(true);
   const staff = currentStaff();
   if (!perms(staff.role).editClient) return toast("Sem permissão.");
   const data = Object.fromEntries(new FormData(e.target));
@@ -1163,8 +1259,9 @@ function openAddStaffModal() {
   $("modalAddStaff").onsubmit = addStaff;
 }
 
-function addStaff(e) {
+async function addStaff(e) {
   e.preventDefault();
+  await pullRemote(true);
   const staff = currentStaff();
   if (!perms(staff.role).manageCollaborators) return toast("Sem permissão.");
   const data = Object.fromEntries(new FormData(e.target));
@@ -1192,8 +1289,9 @@ function openEditStaffModal(id) {
   $("modalEditStaff").onsubmit = editStaff;
 }
 
-function editStaff(e) {
+async function editStaff(e) {
   e.preventDefault();
+  await pullRemote(true);
   const owner = currentStaff();
   if (!perms(owner.role).manageCollaborators) return toast("Sem permissão.");
   const data = Object.fromEntries(new FormData(e.target));
@@ -1242,4 +1340,27 @@ window.addEventListener("storage", (event) => {
   render();
 });
 
-render();
+localChannel && (localChannel.onmessage = (event) => {
+  if (!event.data || !event.data.type) return;
+  const fresh = loadDB();
+  if ((fresh.revision || 0) !== (db.revision || 0) || fresh.updatedAt !== db.updatedAt) {
+    db = fresh;
+    render();
+  }
+});
+
+async function initApp() {
+  sync.started = true;
+  render();
+  await pullRemote(true);
+  render();
+  setInterval(async () => {
+    const changed = await pullRemote(false);
+    if (!changed && sync.started) {
+      const badgeEls = document.querySelectorAll('.topbar .badge, .hero-card .badge');
+      // Mantém o indicador atualizado sem forçar recarregamento visual pesado.
+    }
+  }, SYNC_INTERVAL_MS);
+}
+
+initApp();
